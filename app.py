@@ -22,12 +22,9 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import db_conn, db_path
+from common.github import parse_pr_url
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
@@ -38,6 +35,8 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
 if "pr_url" not in st.session_state:
     st.session_state.pr_url = ""
+if "pr_url_input" not in st.session_state:
+    st.session_state.pr_url_input = st.session_state.pr_url
 if "interrupt_payload" not in st.session_state:
     st.session_state.interrupt_payload = None
 if "final" not in st.session_state:
@@ -50,18 +49,74 @@ st.title("HITL PR Review Agent")
 
 
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
+async def recent_sessions() -> list[dict]:
+    async with db_conn() as conn:
+        async with conn.execute("""
+            SELECT thread_id, pr_url, MAX(timestamp) AS last_event,
+                   CASE MAX(CASE risk_level WHEN 'high' THEN 3
+                                            WHEN 'med' THEN 2 ELSE 1 END)
+                       WHEN 3 THEN 'high' WHEN 2 THEN 'med' ELSE 'low'
+                   END AS worst_risk,
+                   COUNT(*) AS events
+              FROM audit_events
+             GROUP BY thread_id, pr_url
+             ORDER BY MAX(timestamp) DESC
+             LIMIT 25
+        """) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def restore_session(thread_id: str) -> dict:
+    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+        await cp.setup()
+        graph = build_graph(cp)
+        snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        result = dict(snapshot.values)
+        interrupts = tuple(i for task in snapshot.tasks for i in task.interrupts)
+        if interrupts:
+            result["__interrupt__"] = interrupts
+        return result
+
+
+def select_session(thread_id: str) -> None:
+    result = asyncio.run(restore_session(thread_id))
+    if not result:
+        st.warning("No checkpoint found for this session.")
+        return
+    st.session_state.thread_id = thread_id
+    st.session_state.pr_url = result.get("pr_url", "")
+    st.session_state.pr_url_input = st.session_state.pr_url
+    st.session_state.interrupt_payload = (
+        result["__interrupt__"][0].value if result.get("__interrupt__") else None
+    )
+    st.session_state.final = None if result.get("__interrupt__") else result
+    st.query_params["thread"] = thread_id
+
+
+if st.session_state.thread_id is None and st.query_params.get("thread"):
+    select_session(st.query_params["thread"])
+
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    sessions = asyncio.run(recent_sessions())
+    if sessions:
+        st.dataframe(sessions, hide_index=True)
+        for session in sessions:
+            if st.button(
+                f"Open {session['thread_id'][:8]} · {session['worst_risk']}",
+                key=f"session_{session['thread_id']}",
+                help=session["pr_url"],
+            ):
+                select_session(session["thread_id"])
+                st.rerun()
+    else:
+        st.caption("No review sessions yet.")
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
 with st.form("start"):
     pr_url = st.text_input(
-        "PR URL", value=st.session_state.pr_url,
+        "PR URL", key="pr_url_input",
         placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
     )
     submitted = st.form_submit_button("Run review")
@@ -81,18 +136,14 @@ def render_approval_card(payload: dict) -> dict | None:
     with st.expander("Diff"):
         st.code(payload.get("diff_preview", ""), language="diff")
 
-    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
+    feedback = st.text_input("Feedback (optional)", key=f"approval_feedback_{st.session_state.thread_id}")
     col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
     if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
+        return {"choice": "approve", "feedback": feedback}
     if col2.button("Reject"):
-        ...
+        return {"choice": "reject", "feedback": feedback}
     if col3.button("Edit"):
-        ...
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -106,11 +157,14 @@ def render_escalation_card(payload: dict) -> dict | None:
     st.markdown(payload["summary"])
 
     with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
-        answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        answers = {
+            question: st.text_input(question, key=f"question_{st.session_state.thread_id}_{index}")
+            for index, question in enumerate(payload["questions"])
+        }
+        if st.form_submit_button("Submit answers"):
+            if all(answer.strip() for answer in answers.values()):
+                return {question: answer.strip() for question, answer in answers.items()}
+            st.warning("Please answer every question before submitting.")
     return None
 
 
@@ -119,26 +173,26 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
     async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
-
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            return await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        return await app.ainvoke(Command(resume=resume_value), cfg)
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
 if submitted and pr_url:
+    try:
+        parse_pr_url(pr_url.strip())
+    except ValueError:
+        st.error("Enter a GitHub pull request URL, for example https://github.com/owner/repo/pull/1.")
+        st.stop()
+    pr_url = pr_url.strip()
     st.session_state.pr_url = pr_url
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.interrupt_payload = None
     st.session_state.final = None
+    st.query_params["thread"] = st.session_state.thread_id
 
     with st.spinner("Fetching PR + asking the LLM..."):
         result = asyncio.run(run_graph(pr_url, st.session_state.thread_id))
@@ -169,10 +223,17 @@ if payload is not None:
 if st.session_state.final is not None:
     final = st.session_state.final
     action = final.get("final_action", "?")
-    if action.startswith("auto") or action.startswith("committed"):
+    if action in {"auto_committed", "auto_approved", "committed", "committed_after_escalation"}:
         st.success(f"✓ {action} — comment posted to {st.session_state.pr_url}")
+        analysis = final.get("analysis")
+        if analysis is not None:
+            st.metric("Confidence", f"{analysis.confidence:.0%}")
+            st.markdown(analysis.summary)
+        st.link_button("View review on GitHub", st.session_state.pr_url + "#discussion_bucket")
     elif action == "rejected":
         st.warning("Rejected — no comment posted")
+    elif action in {"commit_failed", "auto_commit_failed"}:
+        st.error("Could not post the review. Check the GitHub token and repository permissions.")
     else:
         st.info(f"final_action = {action}")
     st.caption(f"thread_id = {st.session_state.thread_id}  ·  replay: "
